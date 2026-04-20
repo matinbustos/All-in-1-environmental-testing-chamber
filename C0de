@@ -1,0 +1,614 @@
+#include <Wire.h>
+#include "Adafruit_SHT31.h"
+#include <MCUFRIEND_kbv.h>
+
+#define SHT_ADDR   0x44
+#define MUX_ADDR   0x70
+#define ADXL1_ADDR 0x53
+#define ADXL2_ADDR 0x1D
+
+// Motor pins
+#define ENA1  44
+#define ENB1  45
+#define IN1_1 40
+#define IN2_1 43
+#define IN3_1 41
+#define IN4_1 42
+#define ENA2  46
+#define ENB2  50
+#define IN1_2 48
+#define IN2_2 49
+#define IN3_2 51
+#define IN4_2 53
+
+#define RELAY1 A13
+#define RELAY2 A14
+
+#define SCREEN_W 480
+#define SCREEN_H 320
+
+#define C_BLACK   0x0000
+#define C_WHITE   0xFFFF
+#define C_CYAN    0x07FF
+#define C_YELLOW  0xFFE0
+#define C_GREEN   0x07E0
+#define C_BLUE    0x001F
+#define C_ORANGE  0xFD20
+#define C_RED     0xF800
+#define C_GRAY    0x8410
+#define C_DKGREEN 0x03E0
+
+enum Phase { IDLE, TAXI, ASCENT, CRUISE, DESCENT, COMPLETE };
+Phase currentPhase     = IDLE;
+Phase prevDisplayPhase = IDLE;
+unsigned long phaseStartTime = 0;
+
+// ALL STAGES SET TO 15 SECONDS
+#define TAXI_DURATION   (15UL * 1000)
+#define ASCENT_DURATION (15UL * 1000)
+#define CRUISE_DURATION (15UL * 1000)
+#define DESCENT_TIMEOUT (15UL * 1000)
+
+#define VIBR_FULL_SPEED   255
+#define VIBR_CRUISE_SPEED 127
+
+#define ADXL_SCALE     0.0078f 
+#define MPU_SCALE      4096.0f  
+
+#define CALIB_SAMPLES  100      
+
+float adxl1_offset = 0;
+float adxl2_offset = 0;
+float mpu_offset   = 0;  
+
+Adafruit_SHT31 sht31 = Adafruit_SHT31();
+MCUFRIEND_kbv  tft;
+
+bool motorState[4]     = {false, false, false, false};
+bool motorStatePrev[4] = {false, false, false, false};
+bool relayState[2]     = {false, false};
+bool relayStatePrev[2] = {false, false};
+int  motorSpeed[4]     = {255, 255, 255, 255};
+int  motorSpeedPrev[4] = {255, 255, 255, 255};
+
+unsigned long lastDisplay    = 0;
+unsigned long lastSensorRead = 0;
+const unsigned long displayInterval    = 500;
+const unsigned long sensorReadInterval = 1000;
+
+float currentRH    = NAN;
+float currentTemp  = NAN;
+float currentRH1   = NAN;
+float currentTemp1 = NAN;
+
+float    prevRH        = -1;
+float    prevTemp      = -1;
+float    prevRH1       = -1;
+float    prevTemp1     = -1;
+bool     prevMotor[4]  = {false, false, false, false};
+bool     prevRelay[2]  = {false, false};
+uint32_t prevRemaining = 9999;
+bool     screenNeedsRedraw = true;
+
+// -------------------------------------------------------
+// Mux helper
+// -------------------------------------------------------
+void selectMuxChannel(uint8_t ch) {
+  if (ch > 7) return;
+  Wire.beginTransmission(MUX_ADDR);
+  Wire.write(1 << ch);
+  Wire.endTransmission();
+}
+
+// -------------------------------------------------------
+// ADXL345 helpers
+// -------------------------------------------------------
+void initADXL(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x2D);
+  Wire.write(0x08);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(addr);
+  Wire.write(0x31);
+  Wire.write(0x02);
+  Wire.endTransmission();
+}
+
+bool readADXL_raw(uint8_t addr, int16_t &rz) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x36);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(addr, (uint8_t)2);
+  if (Wire.available() < 2) return false;
+  rz = Wire.read() | (Wire.read() << 8);
+  return true;
+}
+
+bool readADXL(uint8_t addr, float offset, float &z) {
+  int16_t rz;
+  if (!readADXL_raw(addr, rz)) return false;
+  z = (rz - offset) * ADXL_SCALE;
+  return true;
+}
+
+float calibrateADXL(uint8_t addr) {
+  long sum = 0;
+  int  good = 0;
+  for (int i = 0; i < CALIB_SAMPLES; i++) {
+    int16_t rz;
+    if (readADXL_raw(addr, rz)) {
+      sum += rz;
+      good++;
+    }
+    delay(5);
+  }
+  float offset = good > 0 ? (float)sum / good : 0;
+  offset -= (1.0f / ADXL_SCALE);
+  return offset;
+}
+
+// -------------------------------------------------------
+// Motor / relay control
+// -------------------------------------------------------
+void setMotor(int i, bool on, int spd = -1) {
+  int EN[4]   = {ENA1, ENB1, ENA2, ENB2};
+  int IN_A[4] = {IN1_1, IN3_1, IN1_2, IN3_2};
+  int IN_B[4] = {IN2_1, IN4_1, IN2_2, IN4_2};
+  if (spd >= 0) motorSpeed[i] = spd;
+  motorState[i] = on;
+  if (on) {
+    digitalWrite(IN_A[i], HIGH);
+    digitalWrite(IN_B[i], LOW);
+    analogWrite(EN[i], motorSpeed[i]);
+  } else {
+    digitalWrite(IN_A[i], LOW);
+    digitalWrite(IN_B[i], LOW);
+    analogWrite(EN[i], 0);
+  }
+  motorStatePrev[i] = on;
+
+  if (i == 2) {
+    if (spd >= 0) motorSpeed[3] = motorSpeed[2];
+    setMotor(3, on, motorSpeed[2]);
+  }
+}
+
+void setRelay(int i, bool on) {
+  relayState[i] = on;
+  digitalWrite(i == 0 ? RELAY1 : RELAY2, on ? HIGH : LOW);
+  relayStatePrev[i] = on;
+}
+
+void allOff() {
+  for (int i = 0; i < 4; i++) setMotor(i, false);
+  for (int i = 0; i < 2; i++) setRelay(i, false);
+}
+
+// -------------------------------------------------------
+// Forward declarations
+// -------------------------------------------------------
+void drawArrivalScreen();
+void drawIdleScreen();
+void drawAutoScreenSkeleton();
+
+// -------------------------------------------------------
+// Phase management
+// -------------------------------------------------------
+void enterPhase(Phase p) {
+  currentPhase      = p;
+  phaseStartTime    = millis();
+  screenNeedsRedraw = true;
+
+  switch (p) {
+    case TAXI:
+      allOff();
+      setMotor(0, true);
+      setMotor(1, true, VIBR_FULL_SPEED);
+      setRelay(0, true);
+      break;
+    case ASCENT:
+      allOff();
+      setMotor(1, true, VIBR_FULL_SPEED);
+      setMotor(2, true); 
+      break;
+    case CRUISE:
+      allOff();
+      setMotor(1, true, VIBR_CRUISE_SPEED);
+      setMotor(2, true); 
+      break;
+    case DESCENT:
+      allOff();
+      setMotor(1, true, VIBR_FULL_SPEED);
+      setMotor(0, true);
+      setRelay(0, true);
+      break;
+    case COMPLETE:
+      allOff();
+      drawArrivalScreen();
+      break;
+    default:
+      break;
+  }
+}
+
+void startAutomation() {
+  enterPhase(TAXI);
+}
+
+void stopAutomation() {
+  allOff();
+  currentPhase      = IDLE;
+  screenNeedsRedraw = true;
+}
+
+// -------------------------------------------------------
+// Automation logic
+// -------------------------------------------------------
+void runAutomation() {
+  unsigned long elapsed = millis() - phaseStartTime;
+
+  switch (currentPhase) {
+    case TAXI:
+      if (!isnan(currentRH)) {
+        if (currentRH > 95.0) {
+          if (motorState[0])  { setMotor(0, false); setRelay(0, false); }
+        } else {
+          if (!motorState[0]) { setMotor(0, true);  setRelay(0, true);  }
+        }
+      }
+      if (elapsed >= TAXI_DURATION) enterPhase(ASCENT);
+      break;
+
+    case ASCENT:
+      if (elapsed >= ASCENT_DURATION) enterPhase(CRUISE);
+      break;
+
+    case CRUISE:
+      if (elapsed >= CRUISE_DURATION) enterPhase(DESCENT);
+      break;
+
+    case DESCENT:
+      if (!isnan(currentRH) && currentRH >= 95.0) {
+        enterPhase(COMPLETE);
+      } else if (elapsed >= DESCENT_TIMEOUT) {
+        enterPhase(COMPLETE);
+      } else {
+        if (!motorState[0]) { setMotor(0, true); setRelay(0, true); }
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+// -------------------------------------------------------
+// Serial handler
+// -------------------------------------------------------
+void handleSerial() {
+  static String buffer = "";
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (buffer.length() == 1) {
+        char cmd = buffer.charAt(0);
+        if (cmd == ' ') {
+          if (currentPhase == IDLE || currentPhase == COMPLETE) startAutomation();
+          else                      stopAutomation();
+        } else if (currentPhase == IDLE) {
+          if      (cmd == '1') motorState[0] = !motorState[0];
+          else if (cmd == '2') motorState[1] = !motorState[1];
+          else if (cmd == '3') motorState[2] = !motorState[2];
+          else if (cmd == '4') motorState[3] = !motorState[3];
+          else if (cmd == '5') relayState[0] = !relayState[0];
+          else if (cmd == '6') relayState[1] = !relayState[1];
+        }
+      } else if (buffer.length() >= 2 && currentPhase == IDLE) {
+        char cmd = buffer.charAt(0);
+        int  val = constrain(buffer.substring(1).toInt(), 0, 255);
+        int  idx = -1;
+        if      (cmd=='A'||cmd=='a') idx=0;
+        else if (cmd=='B'||cmd=='b') idx=1;
+        else if (cmd=='C'||cmd=='c') idx=2;
+        else if (cmd=='D'||cmd=='d') idx=3;
+        if (idx >= 0) {
+          motorSpeed[idx] = val;
+        }
+      }
+      buffer = "";
+    } else {
+      buffer += c;
+    }
+  }
+}
+
+// -------------------------------------------------------
+// TFT helpers
+// -------------------------------------------------------
+void drawPill(int x, int y, const char* name, bool on, int spd = -1) {
+  uint16_t bg  = on ? C_DKGREEN : C_GRAY;
+  uint16_t txt = on ? C_WHITE   : 0xC618;
+  tft.fillRoundRect(x, y, 108, 28, 6, bg);
+  tft.drawRoundRect(x, y, 108, 28, 6, on ? C_GREEN : C_GRAY);
+  tft.setTextColor(txt);
+  tft.setTextSize(1);
+  tft.setCursor(x + 5, y + 5);
+  tft.print(name);
+  if (on && spd >= 0) {
+    tft.setCursor(x + 5, y + 15);
+    tft.print(String(map(spd, 0, 255, 0, 100)) + "%");
+  }
+}
+
+void printSensorRow(int x, int y, int w, float temp, float rh, uint16_t rhCol = C_WHITE) {
+  tft.fillRect(x, y, w, 22, C_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(C_WHITE);
+  tft.setCursor(x, y);
+  tft.print(isnan(temp) ? "ERR" : String(temp, 1) + "C");
+  tft.print("  ");
+  tft.setTextColor(rhCol);
+  tft.print(isnan(rh) ? "ERR" : String(rh, 1) + "%");
+}
+
+void drawArrivalScreen() {
+  tft.fillScreen(C_BLACK);
+  tft.fillTriangle(180, 160, 300, 145, 300, 175, C_CYAN);
+  tft.fillTriangle(300, 145, 340, 120, 340, 155, C_CYAN);
+  tft.fillTriangle(300, 175, 340, 175, 340, 200, C_CYAN);
+  tft.fillTriangle(180, 152, 160, 140, 160, 165, C_CYAN);
+  tft.setTextColor(C_YELLOW);
+  tft.setTextSize(3);
+  tft.setCursor(30, 60);
+  tft.print("You have arrived");
+  tft.setCursor(60, 95);
+  tft.print("to your destination");
+  tft.setTextColor(C_CYAN);
+  tft.setTextSize(2);
+  tft.setCursor(130, 240);
+  tft.print("Cycle complete!");
+  tft.setTextColor(C_GRAY);
+  tft.setTextSize(1);
+  tft.setCursor(150, 305);
+  tft.print("SPACE to return to idle");
+}
+
+void drawIdleScreen() {
+  tft.fillScreen(C_BLACK);
+  tft.setTextColor(C_CYAN);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);  tft.print("Motors:");
+  tft.setCursor(10, 50);  tft.print("Speed:");
+  tft.setCursor(10, 90);  tft.print("Relays:");
+  tft.setCursor(10, 130); tft.print("Ambient:");
+  tft.setCursor(10, 160); tft.print("Internal:");
+  tft.setCursor(10, 190); tft.print("ADXL1 Z:");
+  tft.setCursor(10, 220); tft.print("ADXL2 Z:");
+  tft.setTextColor(C_GRAY);
+  tft.setTextSize(1);
+  tft.setCursor(10, 305);
+  tft.print("SPACE = start automation");
+}
+
+void updateIdleScreen() {
+  tft.setTextSize(2);
+  int x = 160, w = 310;
+  tft.fillRect(x, 10, w, 22, C_BLACK);
+  tft.setTextColor(C_WHITE);
+  tft.setCursor(x, 10);
+  for (int i = 0; i < 4; i++) tft.print(motorState[i] ? "ON " : "OFF ");
+
+  tft.fillRect(x, 50, w, 22, C_BLACK);
+  tft.setTextColor(C_WHITE);
+  tft.setCursor(x, 50);
+  for (int i = 0; i < 4; i++) { tft.print(motorSpeed[i]); tft.print(" "); }
+
+  tft.fillRect(x, 90, w, 22, C_BLACK);
+  tft.setTextColor(C_WHITE);
+  tft.setCursor(x, 90);
+  for (int i = 0; i < 2; i++) tft.print(relayState[i] ? "ON " : "OFF ");
+
+  printSensorRow(x, 130, w, currentTemp, currentRH);
+  printSensorRow(x, 160, w, currentTemp1, currentRH1);
+
+  float az1 = 0;
+  readADXL(ADXL1_ADDR, adxl1_offset, az1);
+  tft.fillRect(x, 190, w, 22, C_BLACK);
+  tft.setTextColor(C_WHITE);
+  tft.setCursor(x, 190);
+  tft.print(az1, 3); tft.print("g");
+
+  float az2 = 0;
+  selectMuxChannel(1);
+  readADXL(ADXL2_ADDR, adxl2_offset, az2);
+  tft.fillRect(x, 220, w, 22, C_BLACK);
+  tft.setTextColor(C_WHITE);
+  tft.setCursor(x, 220);
+  tft.print(az2, 3); tft.print("g");
+}
+
+const char* phaseName(Phase p) {
+  switch (p) {
+    case TAXI:    return "TAXI";
+    case ASCENT:  return "ASCENT";
+    case CRUISE:  return "CRUISE";
+    case DESCENT: return "DESCENT";
+    default:      return "---";
+  }
+}
+
+uint16_t phaseColor(Phase p) {
+  switch (p) {
+    case TAXI:    return C_YELLOW;
+    case ASCENT:  return C_GREEN;
+    case CRUISE:  return C_BLUE;
+    case DESCENT: return C_ORANGE;
+    default:      return C_WHITE;
+  }
+}
+
+void drawAutoScreenSkeleton() {
+  tft.fillScreen(C_BLACK);
+  tft.fillRect(0, 0, SCREEN_W, 50, 0x1082);
+  tft.drawRect(0, 0, SCREEN_W, 50, C_GRAY);
+  tft.setTextSize(3);
+  tft.setTextColor(phaseColor(currentPhase));
+  tft.setCursor(10, 12);
+  tft.print(phaseName(currentPhase));
+  tft.setTextColor(C_CYAN);
+  tft.setTextSize(2);
+  tft.setCursor(10,  58); tft.print("Time left:");
+  tft.setCursor(10,  88); tft.print("Ambient:");
+  tft.setCursor(10, 118); tft.print("Internal:");
+  tft.setCursor(10, 148); tft.print("Components:");
+  tft.drawFastHLine(0, 143, SCREEN_W, C_GRAY);
+  tft.setTextColor(C_GRAY);
+  tft.setTextSize(1);
+  tft.setCursor(10, 308);
+  tft.print("SPACE = stop automation");
+}
+
+void updateAutoScreen() {
+  uint16_t pcol = phaseColor(currentPhase);
+  if (currentPhase != prevDisplayPhase) {
+    tft.fillRect(10, 12, 300, 30, 0x1082);
+    tft.setTextSize(3);
+    tft.setTextColor(pcol);
+    tft.setCursor(10, 12);
+    tft.print(phaseName(currentPhase));
+    prevDisplayPhase = currentPhase;
+  }
+  unsigned long dur = 0;
+  if      (currentPhase == TAXI)   dur = TAXI_DURATION;
+  else if (currentPhase == ASCENT) dur = ASCENT_DURATION;
+  else if (currentPhase == CRUISE) dur = CRUISE_DURATION;
+  else if (currentPhase == DESCENT) dur = DESCENT_TIMEOUT;
+
+  unsigned long elapsed = millis() - phaseStartTime;
+  uint32_t remaining = (elapsed < dur) ? (dur - elapsed) / 1000 : 0;
+
+  if (remaining != prevRemaining) {
+    tft.fillRect(160, 58, 200, 22, C_BLACK);
+    tft.setTextColor(pcol);
+    tft.setTextSize(2);
+    tft.setCursor(160, 58);
+    int mins = remaining / 60;
+    int secs = remaining % 60;
+    if (mins > 0) { tft.print(mins); tft.print("m "); }
+    tft.print(secs); tft.print("s");
+    prevRemaining = remaining;
+  }
+
+  printSensorRow(160, 88, 180, currentTemp, currentRH);
+  printSensorRow(160, 118, 180, currentTemp1, currentRH1);
+
+  // ACCELEROMETER DATA: A2 on top, A1 on bottom, renamed "Vibr"
+  float az1 = 0, az2 = 0;
+  readADXL(ADXL1_ADDR, adxl1_offset, az1);
+  selectMuxChannel(1);
+  readADXL(ADXL2_ADDR, adxl2_offset, az2);
+  
+  tft.setTextSize(2); tft.setTextColor(C_WHITE);
+  tft.fillRect(350, 88, 120, 50, C_BLACK);
+  tft.setCursor(350, 88);  tft.print("Vibr:"); tft.print(az2, 2); // A2 now on top
+  tft.setCursor(350, 118); tft.print("Vibr:"); tft.print(az1, 2); // A1 now on bottom
+
+  int px = 10, py = 158, gap = 115;
+  const char* mnames[4] = {"Pump", "Vibr", "Vacp", "M4"};
+  for (int i = 0; i < 4; i++) {
+    int spd = (i == 1) ? motorSpeed[1] : -1;
+    drawPill(px + i * gap, py, mnames[i], motorState[i], spd);
+    prevMotor[i] = motorState[i];
+  }
+  const char* rnames[2] = {"Rly1", "Rly2"};
+  for (int i = 0; i < 2; i++) {
+    drawPill(px + i * gap, py + 35, rnames[i], relayState[i]);
+    prevRelay[i] = relayState[i];
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  pinMode(ENA1,  OUTPUT); pinMode(ENB1,  OUTPUT);
+  pinMode(IN1_1, OUTPUT); pinMode(IN2_1, OUTPUT);
+  pinMode(IN3_1, OUTPUT); pinMode(IN4_1, OUTPUT);
+  pinMode(ENA2,  OUTPUT); pinMode(ENB2,  OUTPUT);
+  pinMode(IN1_2, OUTPUT); pinMode(IN2_2, OUTPUT);
+  pinMode(IN3_2, OUTPUT); pinMode(IN4_2, OUTPUT);
+  pinMode(RELAY1, OUTPUT);
+  pinMode(RELAY2, OUTPUT);
+
+  uint16_t ID = tft.readID();
+  tft.begin(ID);
+  tft.setRotation(3);
+  tft.fillScreen(C_BLACK);
+  tft.setCursor(10, 10);
+  tft.print("Initializing Rig...");
+
+  initADXL(ADXL1_ADDR);
+  selectMuxChannel(1);
+  initADXL(ADXL2_ADDR);
+  selectMuxChannel(0);
+  sht31.begin(SHT_ADDR);
+  selectMuxChannel(1);
+  sht31.begin(SHT_ADDR);
+
+  adxl1_offset = calibrateADXL(ADXL1_ADDR);
+  selectMuxChannel(1);
+  adxl2_offset = calibrateADXL(ADXL2_ADDR);
+
+  drawIdleScreen();
+}
+
+void loop() {
+  handleSerial();
+  if (millis() - lastSensorRead >= sensorReadInterval) {
+    lastSensorRead = millis();
+    selectMuxChannel(0);
+    currentRH   = sht31.readHumidity();
+    currentTemp = sht31.readTemperature();
+    selectMuxChannel(1);
+    currentRH1   = sht31.readHumidity();
+    currentTemp1 = sht31.readTemperature();
+  }
+
+  if (currentPhase != IDLE && currentPhase != COMPLETE) runAutomation();
+  if (currentPhase == IDLE) { motorUpdate(); relayUpdate(); }
+
+  if (millis() - lastDisplay >= displayInterval) {
+    lastDisplay = millis();
+    if (screenNeedsRedraw) {
+      if (currentPhase == IDLE) drawIdleScreen();
+      else if (currentPhase == COMPLETE) drawArrivalScreen();
+      else                      drawAutoScreenSkeleton();
+      screenNeedsRedraw = false;
+    }
+    if (currentPhase == IDLE) updateIdleScreen();
+    else if (currentPhase != COMPLETE) updateAutoScreen();
+  }
+}
+
+void motorUpdate() {
+  int EN[4]   = {ENA1, ENB1, ENA2, ENB2};
+  int IN_A[4] = {IN1_1, IN3_1, IN1_2, IN3_2};
+  int IN_B[4] = {IN2_1, IN4_1, IN2_2, IN4_2};
+  for (int i = 0; i < 4; i++) {
+    if (i == 3) continue;
+    if (motorState[i] != motorStatePrev[i] || motorSpeed[i] != motorSpeedPrev[i]) {
+      setMotor(i, motorState[i], motorSpeed[i]);
+      motorSpeedPrev[i] = motorSpeed[i]; 
+    }
+  }
+}
+
+void relayUpdate() {
+  int REL[2] = {RELAY1, RELAY2};
+  for (int i = 0; i < 2; i++) {
+    if (relayState[i] != relayStatePrev[i]) {
+      digitalWrite(REL[i], relayState[i] ? HIGH : LOW);
+      relayStatePrev[i] = relayState[i];
+    }
+  }
+}
